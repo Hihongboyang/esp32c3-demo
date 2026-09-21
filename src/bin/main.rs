@@ -29,22 +29,33 @@ async fn main(_spawner: Spawner) -> ! {
 
     let mut led = Output::new(peripherals.GPIO8, Level::High, OutputConfig::default());
 
-    let mut boot_button = Input::new(peripherals.GPIO9, InputConfig::default().with_pull(Pull::Up));
+    let boot_button = Input::new(
+        peripherals.GPIO9,
+        InputConfig::default().with_pull(Pull::Up),
+    );
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 
-    let mut last = false;
     let mut count = 0u32;
+    let mut armed = true;
 
     loop {
-        let pressed = boot_button.is_high();
-        if pressed && !last {
-            count += 1;
-            led.toggle();
-            esp_println::println!("boot button pressed: {}", count);
+        if armed && boot_button.is_low() {
+            Timer::after(Duration::from_millis(20)).await;
+            if boot_button.is_low() {
+                count += 1;
+                led.toggle();
+                esp_println::println!("boot button pressed: {}", count);
+                armed = false;
+            }
         }
-        last = pressed;
-        Timer::after(Duration::from_millis(1)).await;
+
+        if !armed && boot_button.is_high() {
+            Timer::after(Duration::from_millis(20)).await;
+            if boot_button.is_high() {
+                armed = true;
+            }
+        }
     }
 }
