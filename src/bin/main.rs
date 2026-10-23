@@ -64,6 +64,15 @@ fn vline(fb: &mut FrameBuffer, x: u16, y0: u16, y1: u16) {
     }
 }
 
+/// 填充黑色矩形：左上角 (x0, y0)，宽 w 高 h（半开区间，和 hline/vline 一样画黑）
+fn fill_rect(fb: &mut FrameBuffer, x0: u16, y0: u16, w: u16, h: u16) {
+    for y in y0..y0 + h {
+        for x in x0..x0 + w {
+            fb.set_pixel(x, y, false);
+        }
+    }
+}
+
 /// Bresenham 直线：纯整数运算画任意方向线段（1965 年的算法，嵌入式至今在用）
 fn line(fb: &mut FrameBuffer, x0: i32, y0: i32, x1: i32, y1: i32) {
     let dx = (x1 - x0).abs();
@@ -220,25 +229,23 @@ async fn main(_spawner: Spawner) -> ! {
     epd.init().await;
 
     // ===== 组帧：纯计算，随便画 =====
-    hline(fb, 0, 199, 0); // 四条边框
-    hline(fb, 0, 199, 199);
-    vline(fb, 0, 0, 199);
-    vline(fb, 199, 0, 199);
+    // 网格：外框一圈 + 内部每 22px 一条横竖线，把屏幕分成 9×9 格
+    hline(fb, 1, 198, 0);
+    vline(fb, 0, 1, 198);
+    for i in 1..10 {
+        hline(fb, 0, 198, 22 * i);
+        vline(fb, 22 * i, 0, 198);
+    }
 
-    hline(fb, 33, 166, 33); // 第二层四条边框
-    hline(fb, 33, 166, 166);
-    vline(fb, 33, 33, 166);
-    vline(fb, 166, 33, 166);
-
-    hline(fb, 66, 133, 66); // 第三层四条边框
-    hline(fb, 66, 133, 133);
-    vline(fb, 66, 66, 133);
-    vline(fb, 133, 66, 133);
-
-    line(fb, 0, 0, 66, 66); // 画四条斜线
-    line(fb, 133, 66, 199, 0);
-    line(fb, 66, 133, 0, 199);
-    line(fb, 133, 133, 199, 199);
+    // 棋盘格：9×9 格里只填 (行+列)=偶数的格子，相邻格自然留白。
+    // fill_rect 宽 22 = 整格 + 右/下那条网格线（同色覆盖，视觉不变）
+    for j in 0..9 {
+        for i in 0..9 {
+            if (i + j) % 2 == 0 {
+                fill_rect(fb, 22 * i + 1, 22 * j + 1, 22, 22);
+            }
+        }
+    }
 
     // ===== 推屏：一次成型 =====
     esp_println::println!("=== 第 5 课：推第一幅画 ===");
