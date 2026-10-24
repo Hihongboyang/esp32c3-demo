@@ -192,8 +192,22 @@ impl Epd {
         self.refresh_full().await;
     }
 
-    /// 局刷基准：0x24 与 0x26 写同一帧，再全刷（demo: DisplayPartBaseImage）
+    /// 恢复全刷模式：整屏窗口、指针复位、边框跟随、装回全刷波形表。
+    /// 局刷会改动这四样配置；任何整帧写入（push_base / push_frame）之前都必须先调用。
+    /// （demo 的等价做法是每次局刷演示前重新 HDirInit 完整初始化）
+    async fn use_full_config(&mut self) {
+        self.cmd(0x44, &[0x00, 0x18]);
+        self.cmd(0x45, &[0xC7, 0x00, 0x00, 0x00]);
+        self.cmd(0x3C, &[0x01]);
+        self.cmd(0x4E, &[0x00]);
+        self.cmd(0x4F, &[0xC7, 0x00]);
+        self.wait_idle(3_000).await;
+        self.set_lut(&WF_FULL).await;
+    }
+
+    /// 局刷基准：恢复全刷模式后，0x24 与 0x26 写同一帧，再全刷（demo: DisplayPartBaseImage）
     async fn push_base(&mut self, fb: &[u8; 5_000]) {
+        self.use_full_config().await;
         self.cmd(0x24, fb);
         self.cmd(0x26, fb);
         self.refresh_full().await;
@@ -209,7 +223,7 @@ impl Epd {
 
     /// 局刷一块矩形区域（第 5 课定的坐标系）。x、w 必须是 8 的倍数；y、h 不用
     async fn push_region(&mut self, fb: &[u8; 5_000], x: u16, y: u16, w: u16, h: u16) {
-        // —— 换装：demo 每次局刷前都完整重做，照抄 ——
+        // —— 装载局刷配置：demo 每次局刷前都完整重做，照抄 ——
         self.reset_fast().await;
         self.set_lut(&WF_PARTIAL).await;
         self.cmd(
@@ -221,22 +235,29 @@ impl Epd {
         self.cmd(0x20, &[]);
         self.wait_idle(3_000).await;
 
-        // —— 圈地：窗口。0x44 的 x 是字节地址（除以 8）；0x45 的 y 是行号，小端两字节
+        // —— 设置窗口与指针（勘误修正版，见下方勘误框）——
+        // 本驱动的数据入口模式是 0x11 = 0x01：X 递增、Y 递减。
+        // 整帧写入里 fb 第 r 行落在 RAM 第 199−r 行（指针从 199 起、逐行递减）。
+        // 区域写入必须遵守同一映射：窗口与指针用镜像行号 199−y，
+        // 行数据仍按 fb 顺序（从小到大）发送，第一行落在指针处、之后逐行递减。
+        // x 方向不受影响：X 递增，窗口从 x 到 x_end，行内字节从左到右。
         let (x_end, y_end) = (x + w - 1, y + h - 1);
+        let ram_start = 199 - y; // fb 行 y 对应的 RAM 行
+        let ram_end = 199 - y_end; // fb 行 y_end 对应的 RAM 行（ram_start ≥ ram_end）
         self.cmd(0x44, &[(x >> 3) as u8, (x_end >> 3) as u8]);
         self.cmd(
             0x45,
             &[
-                (y & 0xFF) as u8,
-                (y >> 8) as u8,
-                (y_end & 0xFF) as u8,
-                (y_end >> 8) as u8,
+                (ram_start & 0xFF) as u8,
+                (ram_start >> 8) as u8,
+                (ram_end & 0xFF) as u8,
+                (ram_end >> 8) as u8,
             ],
         );
 
-        // —— 落笔点：地址指针（demo 在设完指针后等了一次闲）——
+        // —— 写入起点：地址指针放在扫描起点 ram_start（demo 在设完指针后等了一次空闲）——
         self.cmd(0x4E, &[(x >> 3) as u8]);
-        self.cmd(0x4F, &[(y & 0xFF) as u8, (y >> 8) as u8]);
+        self.cmd(0x4F, &[(ram_start & 0xFF) as u8, (ram_start >> 8) as u8]);
         self.wait_idle(3_000).await;
 
         // —— 只写窗口内的字节：一个 0x24 命令块，行与行之间 CS 不断开
@@ -323,7 +344,7 @@ async fn main(_spawner: Spawner) -> ! {
         let old_x = sx;
         sx += SQ; // 右移一格
         if sx + SQ > 192 {
-            sx = 8; // 到头回卷（右边留 7px，别压边框）
+            sx = 8; // 到最右端后回到最左端（右边留 7 像素，不与边框重叠）
         }
 
         // 改画布：擦旧块（画白）、画新块（画黑）
@@ -336,7 +357,7 @@ async fn main(_spawner: Spawner) -> ! {
             }
         }
 
-        // 圈脏区：罩住「擦旧 + 画新」；回卷那步偷懒刷整条带
+        // 计算脏区：罩住「擦旧 + 画新」；回到起点的那一步简化处理，刷整条带
         if sx > old_x {
             epd.push_region(&fb.0, old_x, Y0, sx + SQ - old_x, SQ).await;
         } else {
