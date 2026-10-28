@@ -27,6 +27,7 @@ const WF_FULL: [u8; 159] = [
     0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x22, 0x22, 0x22, 0x22,
     0x22, 0x22, 0x0, 0x0, 0x0, 0x22, 0x17, 0x41, 0x0, 0x32, 0x20,
 ];
+
 // ===== 局刷波形表（demo 的 WF_PARTIAL_1IN54_0，老师提供，勿手打） =====
 const WF_PARTIAL: [u8; 159] = [
     0x0, 0x40, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x80, 0x80, 0x0, 0x0, 0x0, 0x0,
@@ -77,6 +78,7 @@ fn vline(fb: &mut FrameBuffer, x: u16, y0: u16, y1: u16) {
 }
 
 /// Bresenham 直线：纯整数运算画任意方向线段（1965 年的算法，嵌入式至今在用）
+#[allow(dead_code)]
 fn line(fb: &mut FrameBuffer, x0: i32, y0: i32, x1: i32, y1: i32) {
     let dx = (x1 - x0).abs();
     let dy = -(y1 - y0).abs();
@@ -100,7 +102,7 @@ fn line(fb: &mut FrameBuffer, x0: i32, y0: i32, x1: i32, y1: i32) {
     }
 }
 
-// ===== L1 层驱动：第 4 课的 Epd + 新增 push_frame =====
+// ===== L1 层驱动：第 4 课的 Epd + 第 6 课的局刷 =====
 
 struct Epd {
     spi: Spi<'static, Blocking>,
@@ -187,7 +189,9 @@ impl Epd {
     }
 
     /// 推帧：整帧写 0x24（0x26 第二帧面这节课不碰，留给第 6 课局刷）
+    #[allow(dead_code)]
     async fn push_frame(&mut self, fb: &[u8; 5_000]) {
+        self.use_full_config().await; // 勘误 2：局刷会改动窗口与波形表，写整帧前先恢复
         self.cmd(0x24, fb);
         self.refresh_full().await;
     }
@@ -213,37 +217,57 @@ impl Epd {
         self.refresh_full().await;
     }
 
-    /// RST 快翻：低 2ms → 高 2ms（demo 局刷序列开头；和 init 的 20/5/20 完全不同）
-    async fn reset_fast(&mut self) {
-        self.rst.set_low();
-        Timer::after(Duration::from_millis(2)).await;
-        self.rst.set_high();
-        Timer::after(Duration::from_millis(2)).await;
-    }
-
-    /// 局刷一块矩形区域（第 5 课定的坐标系）。x、w 必须是 8 的倍数；y、h 不用
-    async fn push_region(&mut self, fb: &[u8; 5_000], x: u16, y: u16, w: u16, h: u16) {
-        // —— 装载局刷配置：demo 每次局刷前都完整重做，照抄 ——
-        self.reset_fast().await;
+    /// 进入局刷模式（demo: EPD_1IN54_V2_Init_Partial，只做一次）。
+    /// 关键差异：0x37 第 6 字节 F[6] 是「Display Mode 2 的 RAM 乒乓」开关（SSD1681 手册）。
+    /// demo 发 0x40 开乒乓并每步写整帧才成立；我们按 GxEPD2 的窗口局刷配方：
+    /// 关乒乓（0x00），0x26 上一帧基准由 push_region 刷新后手动维护。
+    async fn init_partial(&mut self) {
+        self.reset().await;
+        self.wait_idle(3_000).await;
+        self.cmd(0x01, &[0xC7, 0x00, 0x01]);
+        self.cmd(0x11, &[0x01]);
+        self.cmd(0x44, &[0x00, 0x18]);
+        self.cmd(0x45, &[0xC7, 0x00, 0x00, 0x00]);
         self.set_lut(&WF_PARTIAL).await;
         self.cmd(
             0x37,
-            &[0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00],
+            //            └ F[6]=0：RAM Ping-Pong 关闭（demo 为 0x40=开启）
+            &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         );
         self.cmd(0x3C, &[0x80]);
         self.cmd(0x22, &[0xC0]);
         self.cmd(0x20, &[]);
         self.wait_idle(3_000).await;
+    }
 
-        // —— 设置窗口与指针（勘误修正版，见下方勘误框）——
-        // 本驱动的数据入口模式是 0x11 = 0x01：X 递增、Y 递减。
-        // 整帧写入里 fb 第 r 行落在 RAM 第 199−r 行（指针从 199 起、逐行递减）。
-        // 区域写入必须遵守同一映射：窗口与指针用镜像行号 199−y，
-        // 行数据仍按 fb 顺序（从小到大）发送，第一行落在指针处、之后逐行递减。
-        // x 方向不受影响：X 递增，窗口从 x 到 x_end，行内字节从左到右。
+    /// 局刷一块矩形区域（第 5 课定的坐标系）。x、w 必须是 8 的倍数；y、h 不用。
+    /// 配方（GxEPD2 drawImage，同为 SSD1681，实机验证可擦除）：
+    /// ① 设窗口 → 写 0x24（新帧） ② 0x22 CF + 0x20 差分点火（0x26 旧 → 0x24 新）
+    /// ③ 刷新完成后把同一份新帧窗口补写进 0x26——乒乓关闭时上一帧基准由软件维护，
+    ///    不补写的话 0x26 永远停在基准帧，旧方块的黑→白差异对不上，方块越积越多。
+    async fn push_region(&mut self, new: &[u8; 5_000], x: u16, y: u16, w: u16, h: u16) {
+        // —— 窗口与指针（勘误 1：镜像行号 199−y）——
         let (x_end, y_end) = (x + w - 1, y + h - 1);
         let ram_start = 199 - y; // fb 行 y 对应的 RAM 行
         let ram_end = 199 - y_end; // fb 行 y_end 对应的 RAM 行（ram_start ≥ ram_end）
+        let bytes_per_row = (w >> 3) as usize;
+
+        // ① 写 0x24（新帧）
+        self.set_window(x, x_end, ram_start, ram_end);
+        self.write_region_plane(0x24, new, x, y, y_end, bytes_per_row);
+
+        // ② 点火：局刷组合 0xCF = Display Mode 2 差分刷新（demo: TurnOnDisplayPart）
+        self.cmd(0x22, &[0xCF]);
+        self.cmd(0x20, &[]);
+        self.wait_idle(3_000).await;
+
+        // ③ 刷新已把新帧搬上屏；补写 0x26 让基准跟上（GxEPD2: writeImageAgain）
+        self.set_window(x, x_end, ram_start, ram_end);
+        self.write_region_plane(0x26, new, x, y, y_end, bytes_per_row);
+    }
+
+    /// 设置 RAM 窗口（0x44/0x45）与地址指针（0x4E/0x4F）。写每个帧面前各调一次
+    fn set_window(&mut self, x: u16, x_end: u16, ram_start: u16, ram_end: u16) {
         self.cmd(0x44, &[(x >> 3) as u8, (x_end >> 3) as u8]);
         self.cmd(
             0x45,
@@ -254,18 +278,24 @@ impl Epd {
                 (ram_end >> 8) as u8,
             ],
         );
-
-        // —— 写入起点：地址指针放在扫描起点 ram_start（demo 在设完指针后等了一次空闲）——
         self.cmd(0x4E, &[(x >> 3) as u8]);
         self.cmd(0x4F, &[(ram_start & 0xFF) as u8, (ram_start >> 8) as u8]);
-        self.wait_idle(3_000).await;
+    }
 
-        // —— 只写窗口内的字节：一个 0x24 命令块，行与行之间 CS 不断开
+    /// 往指定帧面写窗口内的行数据：一个命令块，CS 不断开（0x24 新帧 / 0x26 基准维护）
+    fn write_region_plane(
+        &mut self,
+        plane: u8,
+        fb: &[u8; 5_000],
+        x: u16,
+        y: u16,
+        y_end: u16,
+        bytes_per_row: usize,
+    ) {
         self.cs.set_low();
         self.dc.set_low();
-        self.spi.write(&[0x24]).expect("SPI 写命令失败");
+        self.spi.write(&[plane]).expect("SPI 写命令失败");
         self.dc.set_high();
-        let bytes_per_row = (w >> 3) as usize;
         for row in y..=y_end {
             let first = (row as usize) * 25 + (x >> 3) as usize;
             self.spi
@@ -273,11 +303,6 @@ impl Epd {
                 .expect("SPI 写数据失败");
         }
         self.cs.set_high();
-
-        // —— 点火：局刷组合 0xCF ——
-        self.cmd(0x22, &[0xCF]);
-        self.cmd(0x20, &[]);
-        self.wait_idle(1_500).await;
     }
 }
 
@@ -336,6 +361,7 @@ async fn main(_spawner: Spawner) -> ! {
     // ===== 第 1 步：立基准（最后一次大扫除，~2s） =====
     esp_println::println!("立局刷基准……");
     epd.push_base(&fb.0).await;
+    epd.init_partial().await; // 进入局刷模式（demo: Init_Partial，整个循环只做这一次）
 
     // ===== 第 2+3 步：局刷循环——方块向右滑 =====
     let mut partials: u32 = 0;
@@ -348,6 +374,7 @@ async fn main(_spawner: Spawner) -> ! {
         }
 
         // 改画布：擦旧块（画白）、画新块（画黑）
+        // fb 即「想要变成的帧」，直接写 0x24；上一帧基准 0x26 由控制器自己维护
         for yy in Y0..Y0 + SQ {
             for xx in old_x..old_x + SQ {
                 fb.set_pixel(xx, yy, true);
