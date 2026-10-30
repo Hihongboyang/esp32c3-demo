@@ -16,7 +16,7 @@ mod buffer;
 mod refresh;
 mod ssd1681;
 
-use buffer::{FrameBuffer, SQ, Y0, hline, invert, step_square, vline};
+use buffer::{FrameBuffer, hline, invert, step_square, vline};
 use refresh::{Refresher, diff};
 use ssd1681::Epd;
 
@@ -24,6 +24,9 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 /// 调试日志总开关：定位完成后改 false 可一键静音
 const LOG: bool = true;
+
+pub(crate) const SQ: u16 = 16; // 方块边长
+pub(crate) const Y0: u16 = 92; // 方块行带
 
 #[allow(
     clippy::large_stack_frames,

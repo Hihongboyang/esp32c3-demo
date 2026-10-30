@@ -1,5 +1,4 @@
-pub(crate) const SQ: u16 = 16; // 方块边长
-pub(crate) const Y0: u16 = 92; // 方块行带
+use crate::{SQ, Y0};
 
 /// 5000 字节画布。不变式：坐标永远以"代码约定方向"存储，1=白 0=黑，MSB 在前
 pub(crate) struct FrameBuffer([u8; 5_000]);

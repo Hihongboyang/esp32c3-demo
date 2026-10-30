@@ -80,7 +80,7 @@ impl Epd {
         self.cmd(0x4E, &[0x00]);
         self.cmd(0x4F, &[0xC7, 0x00]);
         self.wait_idle(3_000).await;
-        self.set_lut("WF", &WF_FULL).await;
+        self.set_lut("WF_FULL", &WF_FULL).await;
     }
 
     /// 全刷：0x22 0xC7 组合开关 → 0x20 点火 → 等忙（标称 ~2s，给 4 倍余量）
