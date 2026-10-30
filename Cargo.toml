@@ -3,6 +3,7 @@ edition      = "2024"
 name         = "esp32c3_one"
 rust-version = "1.88"
 version      = "0.1.0"
+autobins     = false # src/bin/ 下的其余文件是模块，不是独立可执行文件
 
 [[bin]]
 name = "esp32c3_one"
