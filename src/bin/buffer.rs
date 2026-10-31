@@ -1,5 +1,3 @@
-use crate::{SQ, Y0};
-
 /// 5000 字节画布。不变式：坐标永远以"代码约定方向"存储，1=白 0=黑，MSB 在前
 pub(crate) struct FrameBuffer([u8; 5_000]);
 
@@ -74,18 +72,4 @@ pub(crate) fn invert(fb: &mut FrameBuffer) {
     for b in fb.0.iter_mut() {
         *b ^= 0xFF;
     }
-}
-
-/// 方块右移一格（到最右侧后回到最左）。修改了哪些像素由 diff 自动计算，回到起点的情形不需要单独处理
-pub(crate) fn step_square(fb: &mut FrameBuffer, sx: &mut u16) {
-    let new = if *sx + 2 * SQ > 192 { 8 } else { *sx + SQ };
-    for yy in Y0..Y0 + SQ {
-        for xx in *sx..*sx + SQ {
-            fb.set_pixel(xx, yy, true); // 擦旧
-        }
-        for xx in new..new + SQ {
-            fb.set_pixel(xx, yy, false); // 画新
-        }
-    }
-    *sx = new;
 }

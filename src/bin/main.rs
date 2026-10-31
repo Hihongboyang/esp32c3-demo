@@ -16,7 +16,7 @@ mod buffer;
 mod refresh;
 mod ssd1681;
 
-use buffer::{FrameBuffer, hline, invert, step_square, vline};
+use buffer::{FrameBuffer, hline, invert, vline};
 use refresh::{Refresher, diff};
 use ssd1681::Epd;
 
@@ -27,6 +27,20 @@ const LOG: bool = true;
 
 pub(crate) const SQ: u16 = 16; // 方块边长
 pub(crate) const Y0: u16 = 92; // 方块行带
+
+/// 方块右移一格（到最右侧后回到最左）。修改了哪些像素由 diff 自动计算，回到起点的情形不需要单独处理
+pub(crate) fn step_square(fb: &mut FrameBuffer, sx: &mut u16) {
+    let new = if *sx + 2 * SQ > 192 { 8 } else { *sx + SQ };
+    for yy in Y0..Y0 + SQ {
+        for xx in *sx..*sx + SQ {
+            fb.set_pixel(xx, yy, true); // 擦旧
+        }
+        for xx in new..new + SQ {
+            fb.set_pixel(xx, yy, false); // 画新
+        }
+    }
+    *sx = new;
+}
 
 #[allow(
     clippy::large_stack_frames,
