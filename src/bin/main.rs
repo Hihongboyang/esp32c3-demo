@@ -16,9 +16,15 @@ mod buffer;
 mod refresh;
 mod ssd1681;
 
-use buffer::{FrameBuffer, hline, invert, vline};
+use buffer::{FrameBuffer, invert};
 use refresh::{Refresher, diff};
 use ssd1681::Epd;
+
+use embedded_graphics::mono_font::{MonoTextStyle, ascii::FONT_10X20};
+use embedded_graphics::pixelcolor::BinaryColor;
+use embedded_graphics::prelude::*;
+use embedded_graphics::primitives::{Circle, PrimitiveStyle, Rectangle};
+use embedded_graphics::text::{Baseline, Text};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -92,20 +98,36 @@ async fn main(_spawner: Spawner) -> ! {
     esp_println::println!("diff 自检通过");
     *fb = FrameBuffer::new_white(); // 恢复白板，进正式演示
 
-    // ===== 开场图：边框 + 起点方块，第一帧 present 走 R2 立基准 =====
-    hline(fb, 0, 199, 0);
-    hline(fb, 0, 199, 199);
-    vline(fb, 0, 0, 199);
-    vline(fb, 199, 0, 199);
-    let mut sx: u16 = 8;
-    for yy in Y0..Y0 + SQ {
-        for xx in sx..sx + SQ {
-            fb.set_pixel(xx, yy, false);
-        }
-    }
+    // ===== 开场图（e-g 组帧）：边框 + 圆环 + 文字 + 实心矩形 =====
+    let stroke = PrimitiveStyle::with_stroke(BinaryColor::Off, 1); // 黑描边：Off=黑
+    let fill_black = PrimitiveStyle::with_fill(BinaryColor::Off);
+    let fill_white = PrimitiveStyle::with_fill(BinaryColor::On); // 擦除用的白刷
+    let text_style = MonoTextStyle::new(&FONT_10X20, BinaryColor::Off); // 黑字
+
+    // 画边框
+    Rectangle::new(Point::new(0, 0), Size::new(200, 200))
+        .into_styled(stroke)
+        .draw(fb)
+        .ok(); // Error 类型是 Infallible——绘制不可能失败，ok() 丢弃
+    // 画圆
+    Circle::new(Point::new(70, 20), 50)
+        .into_styled(stroke)
+        .draw(fb)
+        .ok();
+    // 画文字
+    Text::with_baseline("Hello!", Point::new(70, 90), text_style, Baseline::Top)
+        .draw(fb)
+        .ok();
+    // 画实心矩形
+    Rectangle::new(Point::new(60, 150), Size::new(80, 28))
+        .into_styled(fill_black)
+        .draw(fb)
+        .ok();
     refresh.present(fb).await; // R2：全刷立基准
 
     // ===== 演示循环：四种决策各看一眼 =====
+    let mut count: u32 = 0;
+    let mut digit_buf: [u8; 4] = [0; 4];
     loop {
         // A) 整屏反色：100% 变更 → 直接转全刷
         Timer::after(Duration::from_millis(700)).await;
@@ -115,10 +137,23 @@ async fn main(_spawner: Spawner) -> ! {
         invert(fb); // 反回来，又一次全刷
         refresh.present(fb).await;
 
-        // B) 滑 11 步：前 10 步局刷积累次数，第 11 步达到 R9 上限 → 全刷重建并清除残影
+        // B) 计数 11 步：数字 +1，脏区=数字那一小块；第 11 步撞 R9 上限转全刷
         for _ in 0..11 {
             Timer::after(Duration::from_millis(700)).await;
-            step_square(fb, &mut sx);
+            count += 1;
+            Rectangle::new(Point::new(93, 113), Size::new(14, 24)) // 白刷擦旧数字
+                .into_styled(fill_white)
+                .draw(fb)
+                .ok();
+            let d = (b'0' + (count % 10) as u8) as char; // 0-9 循环
+            Text::with_baseline(
+                d.encode_utf8(&mut digit_buf),
+                Point::new(95, 115),
+                text_style,
+                Baseline::Top,
+            )
+            .draw(fb)
+            .ok();
             refresh.present(fb).await;
         }
 
