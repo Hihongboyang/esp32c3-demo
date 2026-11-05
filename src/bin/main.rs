@@ -3,7 +3,7 @@
 #![deny(clippy::large_stack_frames)]
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig};
@@ -16,11 +16,14 @@ mod buffer;
 mod refresh;
 mod ssd1681;
 
-use buffer::{FrameBuffer, invert};
+use buffer::FrameBuffer;
 use refresh::{Refresher, diff};
 use ssd1681::Epd;
 
-use embedded_graphics::mono_font::{MonoTextStyle, ascii::FONT_10X20};
+use embedded_graphics::mono_font::{
+    MonoTextStyle,
+    ascii::{FONT_6X12, FONT_10X20},
+};
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{Circle, PrimitiveStyle, Rectangle};
@@ -46,6 +49,87 @@ pub(crate) fn step_square(fb: &mut FrameBuffer, sx: &mut u16) {
         }
     }
     *sx = new;
+}
+
+// ===== 应用层（L4）：页面状态机 =====
+
+/// 装置当前显示哪幅画面。enum = 多选一：同一时刻只处于一个变体
+enum Page {
+    Uptime,
+    Stats,
+}
+
+/// 秒数 → 固定 5 字符右对齐（前导空格，末位总保留），如 " 42"
+fn fmt_secs(buf: &mut [u8; 5], secs: u32) -> &str {
+    let mut v = secs;
+    for b in buf.iter_mut().rev() {
+        // 从个位往高位填
+        *b = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    let n = buf.len() - 1;
+    let (head, _last) = buf.split_at_mut(n); // 末位总保留：0 显示 "    0"
+    for b in head {
+        if *b == b'0' {
+            *b = b' ';
+        } else {
+            break;
+        }
+    }
+    core::str::from_utf8(buf).unwrap() // 全 ASCII，转换不会失败
+}
+
+/// 页面一：运行秒数
+fn render_uptime(fb: &mut FrameBuffer, secs: u32, small: MonoTextStyle<'_, BinaryColor>) {
+    let big = MonoTextStyle::new(&FONT_10X20, BinaryColor::Off);
+    Text::with_baseline("UPTIME", Point::new(10, 10), small, Baseline::Top)
+        .draw(fb)
+        .ok();
+    let mut b = [b'0'; 5];
+    Text::with_baseline(
+        fmt_secs(&mut b, secs),
+        Point::new(75, 80),
+        big,
+        Baseline::Top,
+    )
+    .draw(fb)
+    .ok();
+}
+
+/// 页面二：刷新统计
+fn render_stats(
+    fb: &mut FrameBuffer,
+    partials: u32,
+    fulls: u32,
+    small: MonoTextStyle<'_, BinaryColor>,
+) {
+    let line = MonoTextStyle::new(&FONT_10X20, BinaryColor::Off);
+    Text::with_baseline("STATS", Point::new(10, 10), small, Baseline::Top)
+        .draw(fb)
+        .ok();
+    let (mut b1, mut b2) = ([b'0'; 5], [b'0'; 5]);
+    Text::with_baseline("PART", Point::new(10, 60), line, Baseline::Top)
+        .draw(fb)
+        .ok();
+    Text::with_baseline(
+        fmt_secs(&mut b1, partials),
+        Point::new(80, 60),
+        line,
+        Baseline::Top,
+    )
+    .draw(fb)
+    .ok();
+    Text::with_baseline("FULL", Point::new(10, 95), line, Baseline::Top)
+        .draw(fb)
+        .ok();
+    Text::with_baseline(
+        fmt_secs(&mut b2, fulls),
+        Point::new(80, 95),
+        line,
+        Baseline::Top,
+    )
+    .draw(fb)
+    .ok();
 }
 
 #[allow(
@@ -98,67 +182,29 @@ async fn main(_spawner: Spawner) -> ! {
     esp_println::println!("diff 自检通过");
     *fb = FrameBuffer::new_white(); // 恢复白板，进正式演示
 
-    // ===== 开场图（e-g 组帧）：边框 + 圆环 + 文字 + 实心矩形 =====
-    let stroke = PrimitiveStyle::with_stroke(BinaryColor::Off, 1); // 黑描边：Off=黑
-    let fill_black = PrimitiveStyle::with_fill(BinaryColor::Off);
-    let fill_white = PrimitiveStyle::with_fill(BinaryColor::On); // 擦除用的白刷
-    let text_style = MonoTextStyle::new(&FONT_10X20, BinaryColor::Off); // 黑字
-
-    // 画边框
-    Rectangle::new(Point::new(0, 0), Size::new(200, 200))
-        .into_styled(stroke)
-        .draw(fb)
-        .ok(); // Error 类型是 Infallible——绘制不可能失败，ok() 丢弃
-    // 画圆
-    Circle::new(Point::new(70, 20), 50)
-        .into_styled(stroke)
-        .draw(fb)
-        .ok();
-    // 画文字
-    Text::with_baseline("Hello!", Point::new(70, 90), text_style, Baseline::Top)
-        .draw(fb)
-        .ok();
-    // 画实心矩形
-    Rectangle::new(Point::new(60, 150), Size::new(80, 28))
-        .into_styled(fill_black)
-        .draw(fb)
-        .ok();
-    refresh.present(fb).await; // R2：全刷立基准
-
-    // ===== 演示循环：四种决策各看一眼 =====
-    let mut count: u32 = 0;
-    let mut digit_buf: [u8; 4] = [0; 4];
+    // ===== 应用层主循环：每秒一帧，5 秒一换页 =====
+    let boot = Instant::now();
+    let header = MonoTextStyle::new(&FONT_6X12, BinaryColor::Off);
+    let mut page = Page::Uptime;
+    let mut tick: u32 = 0;
     loop {
-        // A) 整屏反色：100% 变更 → 直接转全刷
-        Timer::after(Duration::from_millis(700)).await;
-        invert(fb);
-        refresh.present(fb).await;
-        Timer::after(Duration::from_millis(1_500)).await;
-        invert(fb); // 反回来，又一次全刷
-        refresh.present(fb).await;
-
-        // B) 计数 11 步：数字 +1，脏区=数字那一小块；第 11 步撞 R9 上限转全刷
-        for _ in 0..11 {
-            Timer::after(Duration::from_millis(700)).await;
-            count += 1;
-            Rectangle::new(Point::new(93, 113), Size::new(14, 24)) // 白刷擦旧数字
-                .into_styled(fill_white)
-                .draw(fb)
-                .ok();
-            let d = (b'0' + (count % 10) as u8) as char; // 0-9 循环
-            Text::with_baseline(
-                d.encode_utf8(&mut digit_buf),
-                Point::new(95, 115),
-                text_style,
-                Baseline::Top,
-            )
-            .draw(fb)
-            .ok();
-            refresh.present(fb).await;
+        Timer::after(Duration::from_millis(1_000)).await;
+        tick += 1;
+        if tick % 5 == 0 {
+            page = match page {
+                Page::Uptime => Page::Stats,
+                Page::Stats => Page::Uptime,
+            };
         }
-
-        // C) 同一帧再推一次 → 跳过（对照日志，屏应没有任何变化）
-        Timer::after(Duration::from_millis(700)).await;
+        // 整帧重组：从白底重画当前页面；变化多少由 diff 说了算
+        fb.clear_white();
+        match page {
+            Page::Uptime => render_uptime(fb, boot.elapsed().as_secs() as u32, header),
+            Page::Stats => {
+                let (partials, fulls) = refresh.stats();
+                render_stats(fb, partials, fulls, header);
+            }
+        }
         refresh.present(fb).await;
     }
 }

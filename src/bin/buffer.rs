@@ -34,6 +34,11 @@ impl FrameBuffer {
     pub(crate) fn copy_from(&mut self, other: &FrameBuffer) {
         self.0.copy_from_slice(&other.0);
     }
+
+    /// 整帧刷白（L10：整帧重组的起点）。fill 直接写数组，无临时整帧
+    pub(crate) fn clear_white(&mut self) {
+        self.0.fill(0xFF);
+    }
 }
 
 /// 画布当 DrawTarget 用：e-g 的图形对象逐像素交给我们，翻译成 set_pixel。

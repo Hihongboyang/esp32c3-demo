@@ -16,6 +16,7 @@ pub(crate) struct Refresher {
     partials: u32,     // 自上次全刷以来的局刷次数
     base_ready: bool,  // 局刷基准是否已立（R2）
     partial_cfg: bool, // 芯片是否处于局刷配置——push_base 会把它切回全刷（第 6 课勘误 5）
+    fulls: u32,        // 累计全刷次数
 }
 
 impl Refresher {
@@ -23,6 +24,7 @@ impl Refresher {
         Self {
             epd,
             shadow: FrameBuffer::new_white(),
+            fulls: 0,
             policy: Policy {
                 max_partials: 10,
                 full_ratio: 60,
@@ -50,6 +52,7 @@ impl Refresher {
                 esp_println::println!("present: 缺基准——全刷立基准（R2）");
             }
             self.epd.push_base(next.bytes()).await;
+            self.fulls += 1;
             self.base_ready = true;
             self.partials = 0;
             self.partial_cfg = false; // 全刷把 LUT/边框切回了全刷配置
@@ -64,6 +67,7 @@ impl Refresher {
                 );
             }
             self.epd.push_base(next.bytes()).await;
+            self.fulls += 1;
             self.partials = 0;
             self.partial_cfg = false;
         } else {
@@ -93,6 +97,10 @@ impl Refresher {
         }
         // R8：刷新成功后更新影子——屏上是什么，影子就是什么
         self.shadow.copy_from(next);
+    }
+
+    pub(crate) fn stats(&self) -> (u32, u32) {
+        (self.fulls, self.partials)
     }
 }
 
