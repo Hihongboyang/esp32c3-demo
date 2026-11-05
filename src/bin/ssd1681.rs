@@ -90,14 +90,6 @@ impl Epd {
         self.wait_idle(8_000).await;
     }
 
-    /// 推帧：整帧写 0x24（0x26 第二帧面这节课不碰，留给第 6 课局刷）
-    #[allow(dead_code)]
-    async fn push_frame(&mut self, fb: &[u8; 5_000]) {
-        self.use_full_config().await; // 勘误 2：局刷会改动窗口与波形表，写整帧前先恢复
-        self.cmd(0x24, fb);
-        self.refresh_full().await;
-    }
-
     /// 等 BUSY 拉低。返回 Some(高电平持续 ms)、None(超时)、Some(0)(刷新根本没开始——重要诊断信号)
     async fn wait_idle(&mut self, timeout_ms: u32) -> Option<u32> {
         let mut waited = 0u32;
@@ -150,6 +142,14 @@ impl Epd {
         self.cmd(0x24, fb);
         self.cmd(0x26, fb);
         self.refresh_full().await;
+    }
+
+    /// 屏幕深层睡眠(demo sleep(): 校验码 0x01
+    /// 画面保持(双稳态): 唤醒只能靠 RST 复位脉冲, 唤醒后 RAM 不保证 (R1)\
+    pub(crate) async fn sleep(&mut self) {
+        self.cmd(0x10, &[0x01]);
+        Timer::after(Duration::from_millis(200)).await;
+        self.rst.set_low();  // demo: 睡下后复位线保持低电平
     }
 
     /// 进入局刷模式（结构照新版库的 Init_Partial，整个循环只做一次）。

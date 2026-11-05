@@ -17,6 +17,7 @@ pub(crate) struct Refresher {
     base_ready: bool,  // 局刷基准是否已立（R2）
     partial_cfg: bool, // 芯片是否处于局刷配置——push_base 会把它切回全刷（第 6 课勘误 5）
     fulls: u32,        // 累计全刷次数
+    force_full: bool,  // R1：屏深睡唤醒后置位——下一次 present 无条件全刷重建，含绕过"跳过"
 }
 
 impl Refresher {
@@ -32,26 +33,45 @@ impl Refresher {
             partials: 0,
             base_ready: false,
             partial_cfg: false,
+            force_full: false,
         }
     }
 
     /// 唯一渲染入口：自动 diff → 按规则选 跳过/全刷重建/局刷
     pub(crate) async fn present(&mut self, next: &FrameBuffer) {
         let (region, ratio) = match diff(next, &self.shadow) {
-            None => {
+            None if !self.force_full => {
                 if LOG {
                     esp_println::println!("present: 两帧一致——跳过（零硬件动作）");
                 }
                 return;
             }
+            // force_full 时 diff = None 也要往下走: R1 唤醒后即使两帧一致
+            // 0x26 基准也不可信, 必须全刷重键( Region 占位, 全刷分支不用它 )
+            None => (
+                Region {
+                    x: 0,
+                    y: 0,
+                    w: 0,
+                    h: 0,
+                },
+                0,
+            ),
             Some(v) => v,
         };
-        if !self.base_ready {
-            // R2：缺基准，先补一次基准全刷（对上层透明，多花一次 2s）
+        if self.force_full || !self.base_ready {
+            // R1/R2：全刷立基准。R1=屏深睡唤醒后 RAM 不保证——哪怕画面看起来还在
+            // （双稳态保持），0x26 也不能再用；R2=开机缺基准，对上层透明
             if LOG {
-                esp_println::println!("present: 缺基准——全刷立基准（R2）");
+                let why = if self.force_full {
+                    "R1 唤醒重建 "
+                } else {
+                    "缺基准(R2)"
+                };
+                esp_println::println!("present: {why}——全刷立基准");
             }
             self.epd.push_base(next.bytes()).await;
+            self.force_full = false;
             self.fulls += 1;
             self.base_ready = true;
             self.partials = 0;
@@ -101,6 +121,18 @@ impl Refresher {
 
     pub(crate) fn stats(&self) -> (u32, u32) {
         (self.fulls, self.partials)
+    }
+    
+    /// 屏进入深睡（画面保持，功耗降到微安级）。R1：唤醒后 0x26 基准不可信——
+    /// 置 force_full，下一次 present 无条件全刷重建（即使画面没变也不许"跳过"）
+    pub(crate) async fn hibernate_screen(&mut self) {
+        self.epd.sleep().await;
+        self.force_full = true;
+    }
+
+    /// 屏唤醒：RST 复位脉冲 + 完整初始化（深睡后 RAM 不保证，init 全部重来）
+    pub(crate) async fn wake_screen(&mut self) {
+        self.epd.init().await;
     }
 }
 

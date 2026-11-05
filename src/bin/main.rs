@@ -26,30 +26,12 @@ use embedded_graphics::mono_font::{
 };
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{Circle, PrimitiveStyle, Rectangle};
 use embedded_graphics::text::{Baseline, Text};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
 /// 调试日志总开关：定位完成后改 false 可一键静音
 const LOG: bool = true;
-
-pub(crate) const SQ: u16 = 16; // 方块边长
-pub(crate) const Y0: u16 = 92; // 方块行带
-
-/// 方块右移一格（到最右侧后回到最左）。修改了哪些像素由 diff 自动计算，回到起点的情形不需要单独处理
-pub(crate) fn step_square(fb: &mut FrameBuffer, sx: &mut u16) {
-    let new = if *sx + 2 * SQ > 192 { 8 } else { *sx + SQ };
-    for yy in Y0..Y0 + SQ {
-        for xx in *sx..*sx + SQ {
-            fb.set_pixel(xx, yy, true); // 擦旧
-        }
-        for xx in new..new + SQ {
-            fb.set_pixel(xx, yy, false); // 画新
-        }
-    }
-    *sx = new;
-}
 
 // ===== 应用层（L4）：页面状态机 =====
 
@@ -187,24 +169,50 @@ async fn main(_spawner: Spawner) -> ! {
     let header = MonoTextStyle::new(&FONT_6X12, BinaryColor::Off);
     let mut page = Page::Uptime;
     let mut tick: u32 = 0;
+    // ===== 会话式主循环：醒 15 步 → 屏深睡 10s → RST 唤醒 → R1 重建 → 再来 =====
     loop {
-        Timer::after(Duration::from_millis(1_000)).await;
-        tick += 1;
-        if tick % 5 == 0 {
-            page = match page {
-                Page::Uptime => Page::Stats,
-                Page::Stats => Page::Uptime,
-            };
-        }
-        // 整帧重组：从白底重画当前页面；变化多少由 diff 说了算
-        fb.clear_white();
-        match page {
-            Page::Uptime => render_uptime(fb, boot.elapsed().as_secs() as u32, header),
-            Page::Stats => {
-                let (partials, fulls) = refresh.stats();
-                render_stats(fb, partials, fulls, header);
+        // 1) 醒着的会话：页面轮换 15 步（约 27s）——上一课的循环原样搬进来
+        for _ in 0..15 {
+            Timer::after(Duration::from_millis(1_000)).await;
+            tick += 1;
+            if tick % 5 == 0 {
+                page = match page {
+                    Page::Uptime => Page::Stats,
+                    Page::Stats => Page::Uptime,
+                };
             }
+            // 整帧重组：从白底重画当前页面；变化多少由 diff 说了算
+            fb.clear_white();
+            match page {
+                Page::Uptime => render_uptime(fb, boot.elapsed().as_secs() as u32, header),
+                Page::Stats => {
+                    let (partials, fulls) = refresh.stats();
+                    render_stats(fb, partials, fulls, header);
+                }
+            }
+            refresh.present(fb).await;
         }
+
+        // 2) 睡前停在 STATS 页并推一帧——内容固定，为唤醒后的 R1 演示做准备
+        page = Page::Stats;
+        fb.clear_white();
+        let (partials, fulls) = refresh.stats();
+        render_stats(fb, partials, fulls, header);
         refresh.present(fb).await;
+        if LOG {
+            esp_println::println!("=== 屏深睡 10s（0x10 0x01 → RST 低）===");
+        }
+        refresh.hibernate_screen().await;
+
+        // 3) 演示用 Timer 代替 C3 深睡（真 C3 深睡见小实验 3：唤醒=重启）
+        Timer::after(Duration::from_secs(10)).await;
+        if LOG {
+            esp_println::println!("=== RST 复位唤醒 + 完整 init ===");
+        }
+        refresh.wake_screen().await;
+
+        // 4) 唤醒后第一帧：fb 原封不动——还是睡前推的那帧 → diff 必为 None。
+        //    没有 force_full 这里会走「跳过」、基准永不重建（隐蔽坑）；R1 强制全刷
+        refresh.present(fb).await; // 日志应打「R1 唤醒重建——全刷立基准」，屏 2s 全刷回同一画面
     }
 }
