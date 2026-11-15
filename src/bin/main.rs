@@ -3,7 +3,7 @@
 #![deny(clippy::large_stack_frames)]
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig};
@@ -33,14 +33,20 @@ esp_bootloader_esp_idf::esp_app_desc!();
 /// 调试日志总开关：定位完成后改 false 可一键静音
 const LOG: bool = true;
 
+/// 醒着的拍数（每拍 1s）与深睡时长——装置的节拍器
+const AWAKE_TICKS: u32 = 8;
+const SLEEP_SECS: u64 = 60;
+
+/// RTC 快速内存：深睡也保电。persistent = 首次上电清零，
+/// 之后重启/深睡唤醒都不再初始化——内容原样保留
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static mut MAGIC: u32 = 0; // 魔数：区分「真数据」和「上电随机值」
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static mut WAKE_COUNT: u32 = 0; // 第几次醒（首次上电算第 1 次）
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static mut AWAKE_SECS: u32 = 0; // 历次会话累计醒着的秒数
+
 // ===== 应用层（L4）：页面状态机 =====
-
-/// 装置当前显示哪幅画面。enum = 多选一：同一时刻只处于一个变体
-enum Page {
-    Uptime,
-    Stats,
-}
-
 /// 秒数 → 固定 5 字符右对齐（前导空格，末位总保留），如 " 42"
 fn fmt_secs(buf: &mut [u8; 5], secs: u32) -> &str {
     let mut v = secs;
@@ -61,51 +67,29 @@ fn fmt_secs(buf: &mut [u8; 5], secs: u32) -> &str {
     core::str::from_utf8(buf).unwrap() // 全 ASCII，转换不会失败
 }
 
-/// 页面一：运行秒数
-fn render_uptime(fb: &mut FrameBuffer, secs: u32, small: MonoTextStyle<'_, BinaryColor>) {
-    let big = MonoTextStyle::new(&FONT_10X20, BinaryColor::Off);
-    Text::with_baseline("UPTIME", Point::new(10, 10), small, Baseline::Top)
-        .draw(fb)
-        .ok();
-    let mut b = [b'0'; 5];
-    Text::with_baseline(
-        fmt_secs(&mut b, secs),
-        Point::new(75, 80),
-        big,
-        Baseline::Top,
-    )
-    .draw(fb)
-    .ok();
-}
-
-/// 页面二：刷新统计
-fn render_stats(
-    fb: &mut FrameBuffer,
-    partials: u32,
-    fulls: u32,
-    small: MonoTextStyle<'_, BinaryColor>,
-) {
+/// 装置页：第几次醒 + 累计醒时。版式 = L10 STATS 页同款
+fn render_wake(fb: &mut FrameBuffer, wake: u32, awake: u32, small: MonoTextStyle<'_, BinaryColor>) {
     let line = MonoTextStyle::new(&FONT_10X20, BinaryColor::Off);
-    Text::with_baseline("STATS", Point::new(10, 10), small, Baseline::Top)
+    Text::with_baseline("DEVICE", Point::new(10, 10), small, Baseline::Top)
         .draw(fb)
         .ok();
     let (mut b1, mut b2) = ([b'0'; 5], [b'0'; 5]);
-    Text::with_baseline("PART", Point::new(10, 60), line, Baseline::Top)
+    Text::with_baseline("WAKE", Point::new(10, 60), line, Baseline::Top)
         .draw(fb)
         .ok();
     Text::with_baseline(
-        fmt_secs(&mut b1, partials),
+        fmt_secs(&mut b1, wake),
         Point::new(80, 60),
         line,
         Baseline::Top,
     )
     .draw(fb)
     .ok();
-    Text::with_baseline("FULL", Point::new(10, 95), line, Baseline::Top)
+    Text::with_baseline("AWAKE", Point::new(10, 95), line, Baseline::Top)
         .draw(fb)
         .ok();
     Text::with_baseline(
-        fmt_secs(&mut b2, fulls),
+        fmt_secs(&mut b2, awake),
         Point::new(80, 95),
         line,
         Baseline::Top,
@@ -164,55 +148,42 @@ async fn main(_spawner: Spawner) -> ! {
     esp_println::println!("diff 自检通过");
     *fb = FrameBuffer::new_white(); // 恢复白板，进正式演示
 
-    // ===== 应用层主循环：每秒一帧，5 秒一换页 =====
-    let boot = Instant::now();
+    // ===== 装置会话：main() 的一次完整运行 = 一次「醒」 =====
     let header = MonoTextStyle::new(&FONT_6X12, BinaryColor::Off);
-    let mut page = Page::Uptime;
-    let mut tick: u32 = 0;
-    // ===== 会话式主循环：醒 15 步 → 屏深睡 10s → RST 唤醒 → R1 重建 → 再来 =====
-    loop {
-        // 1) 醒着的会话：页面轮换 15 步（约 27s）——上一课的循环原样搬进来
-        for _ in 0..15 {
-            Timer::after(Duration::from_millis(1_000)).await;
-            tick += 1;
-            if tick % 5 == 0 {
-                page = match page {
-                    Page::Uptime => Page::Stats,
-                    Page::Stats => Page::Uptime,
-                };
-            }
-            // 整帧重组：从白底重画当前页面；变化多少由 diff 说了算
-            fb.clear_white();
-            match page {
-                Page::Uptime => render_uptime(fb, boot.elapsed().as_secs() as u32, header),
-                Page::Stats => {
-                    let (partials, fulls) = refresh.stats();
-                    render_stats(fb, partials, fulls, header);
-                }
-            }
-            refresh.present(fb).await;
-        }
 
-        // 2) 睡前停在 STATS 页并推一帧——内容固定，为唤醒后的 R1 演示做准备
-        page = Page::Stats;
-        fb.clear_white();
-        let (partials, fulls) = refresh.stats();
-        render_stats(fb, partials, fulls, header);
-        refresh.present(fb).await;
-        if LOG {
-            esp_println::println!("=== 屏深睡 10s（0x10 0x01 → RST 低）===");
+    // 恢复跨睡眠状态：魔数对上 = 深睡唤醒（RTC 内存还在）；对不上 = 冷启动（清零重来）
+    let (wake, awake0) = if unsafe { MAGIC } == 0x00C0_FFEE {
+        unsafe { WAKE_COUNT += 1 };
+        (unsafe { WAKE_COUNT }, unsafe { AWAKE_SECS })
+    } else {
+        unsafe {
+            MAGIC = 0x00C0_FFEE;
+            WAKE_COUNT = 1;
+            AWAKE_SECS = 0;
         }
-        refresh.hibernate_screen().await;
-
-        // 3) 演示用 Timer 代替 C3 深睡（真 C3 深睡见小实验 3：唤醒=重启）
-        Timer::after(Duration::from_secs(10)).await;
-        if LOG {
-            esp_println::println!("=== RST 复位唤醒 + 完整 init ===");
-        }
-        refresh.wake_screen().await;
-
-        // 4) 唤醒后第一帧：fb 原封不动——还是睡前推的那帧 → diff 必为 None。
-        //    没有 force_full 这里会走「跳过」、基准永不重建（隐蔽坑）；R1 强制全刷
-        refresh.present(fb).await; // 日志应打「R1 唤醒重建——全刷立基准」，屏 2s 全刷回同一画面
+        (1, 0)
+    };
+    if LOG {
+        esp_println::println!("=== 第 {wake} 次醒（累计醒 {awake0}s）===");
     }
+
+    // 醒着的 8 拍：首拍走 R2 全刷立基准（重启后 base_ready=false），之后局刷只动数字
+    for i in 0..AWAKE_TICKS {
+        fb.clear_white();
+        render_wake(fb, wake, awake0 + i, header);
+        refresh.present(fb).await;
+        Timer::after(Duration::from_millis(1_000)).await;
+    }
+
+    // 睡前三件事：保存累计 → 屏先睡（画面保持）→ C3 深睡（不返回）
+    unsafe { AWAKE_SECS = awake0 + AWAKE_TICKS };
+    if LOG {
+        esp_println::println!("=== 屏深睡 + C3 深睡 {SLEEP_SECS}s ===");
+    }
+    refresh.hibernate_screen().await;
+    use esp_hal::rtc_cntl::sleep::{LowPower, RtcSleepConfig};
+    use esp_hal::time::{Duration as HalDuration, Instant as HalInstant};
+    let mut lp = LowPower::new(peripherals.LPWR); // LPWR 先认领到变量，同 cs/rst 的拿法
+    lp.set_wakeup_deadline(HalInstant::now() + HalDuration::from_secs(SLEEP_SECS));
+    lp.sleep_deep(RtcSleepConfig::deep()); // 不返回：唤醒=芯片复位重启，从 main 开头再来
 }
