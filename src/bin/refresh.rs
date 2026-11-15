@@ -47,7 +47,7 @@ impl Refresher {
                 return;
             }
             // force_full 时 diff = None 也要往下走: R1 唤醒后即使两帧一致
-            // 0x26 基准也不可信, 必须全刷重键( Region 占位, 全刷分支不用它 )
+            // 0x26 基准也不可信, 必须全刷重建( Region 占位, 全刷分支不用它 )
             None => (
                 Region {
                     x: 0,
@@ -64,7 +64,7 @@ impl Refresher {
             // （双稳态保持），0x26 也不能再用；R2=开机缺基准，对上层透明
             if LOG {
                 let why = if self.force_full {
-                    "R1 唤醒重建 "
+                    "R1 唤醒重建"
                 } else {
                     "缺基准(R2)"
                 };
@@ -119,8 +119,9 @@ impl Refresher {
         self.shadow.copy_from(next);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn stats(&self) -> (u32, u32) {
-        (self.fulls, self.partials)
+        (self.partials, self.fulls)
     }
     
     /// 屏进入深睡（画面保持，功耗降到微安级）。R1：唤醒后 0x26 基准不可信——
@@ -131,6 +132,7 @@ impl Refresher {
     }
 
     /// 屏唤醒：RST 复位脉冲 + 完整初始化（深睡后 RAM 不保证，init 全部重来）
+    #[allow(dead_code)]
     pub(crate) async fn wake_screen(&mut self) {
         self.epd.init().await;
     }

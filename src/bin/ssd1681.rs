@@ -145,7 +145,7 @@ impl Epd {
     }
 
     /// 屏幕深层睡眠(demo sleep(): 校验码 0x01
-    /// 画面保持(双稳态): 唤醒只能靠 RST 复位脉冲, 唤醒后 RAM 不保证 (R1)\
+    /// 画面保持(双稳态): 唤醒只能靠 RST 复位脉冲, 唤醒后 RAM 不保证 (R1)
     pub(crate) async fn sleep(&mut self) {
         self.cmd(0x10, &[0x01]);
         Timer::after(Duration::from_millis(200)).await;

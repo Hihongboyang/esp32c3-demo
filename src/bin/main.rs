@@ -46,7 +46,7 @@ static mut WAKE_COUNT: u32 = 0; // 第几次醒（首次上电算第 1 次）
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static mut AWAKE_SECS: u32 = 0; // 历次会话累计醒着的秒数
 
-// ===== 应用层（L4）：页面状态机 =====
+// ===== 装置页 =====
 /// 秒数 → 固定 5 字符右对齐（前导空格，末位总保留），如 " 42"
 fn fmt_secs(buf: &mut [u8; 5], secs: u32) -> &str {
     let mut v = secs;

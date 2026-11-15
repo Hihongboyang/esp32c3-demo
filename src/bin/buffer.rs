@@ -6,7 +6,6 @@ use embedded_graphics::geometry::OriginDimensions;
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
 
-/// ===== 实现 DrawTarget ======
 pub(crate) struct FrameBuffer([u8; 5_000]);
 
 impl FrameBuffer {
@@ -67,4 +66,3 @@ impl OriginDimensions for FrameBuffer {
         Size::new(200, 200)
     }
 }
-
